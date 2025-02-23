@@ -1417,6 +1417,569 @@ rbd controllerServer CreateSnapshot中的哪几个子函数调用了getOMapValue
 
 _**Assistant**_
 
+  
+
+Let me analyze the CreateSnapshot function and its dependencies to find calls to getOMapValues.
+
+  
+
+The main path that leads to getOMapValues is through the snapshot journal operations. Here are the key functions:
+
+  
+
+45. In CreateSnapshot, when checking for existing snapshots:
+
+```go:internal/rbd/rbd_journal.go
+
+func checkSnapCloneExists(ctx context.Context, parentVol *rbdVolume, rbdSnap *rbdSnapshot, cr *util.Credentials) (bool, error) {
+
+    // ...
+
+    snapData, err := j.CheckReservation(ctx, rbdSnap.JournalPool,
+
+        rbdSnap.RequestName, rbdSnap.NamePrefix, rbdSnap.RbdImageName, "", util.EncryptionTypeNone)
+
+    // ...
+
+}
+
+```
+
+  
+
+46. The CheckReservation call leads to getOMapValues through:
+
+```go:internal/journal/voljournal.go
+
+func (cj *CSIJournal) CheckReservation(...) (*ImageAttributes, error) {
+
+    // This internally calls getOMapValues to check for existing reservations
+
+    return cj.getReservation(...)
+
+}
+
+```
+
+  
+
+47. When validating the snapshot request:
+
+```go:internal/rbd/controllerserver.go
+
+func (cs *ControllerServer) validateSnapshotReq(...) error {
+
+    // This leads to getOMapValues through journal operations
+
+    rbdVol, err := GenVolFromVolID(...)
+
+}
+
+```
+
+  
+
+48. During snapshot metadata operations:
+
+```go:internal/rbd/rbd_util.go
+
+func genSnapFromSnapID(...) (*rbdSnapshot, error) {
+
+    // Uses getOMapValues through journal operations to fetch snapshot metadata
+
+    snapInfo, err := snapJournal.GetImageAttributes(...)
+
+}
+
+```
+
+  
+
+The getOMapValues function is primarily used to:
+
+49. Check for existing snapshot reservations
+
+50. Retrieve snapshot metadata
+
+51. Validate volume and snapshot IDs
+
+52. Manage concurrent snapshot operations
+
+  
+
+The call chain typically follows this pattern:
+
+```
+
+CreateSnapshot
+
+    -> checkSnapCloneExists/validateSnapshotReq/genSnapFromSnapID
+
+        -> journal operations (CheckReservation/GetImageAttributes)
+
+            -> getOMapValues
+
+```
+
+  
+
+This helps maintain consistency and prevent duplicate snapshots while managing metadata in the Ceph cluster.
+
+  
+
+---
+
+  
+
+_**User**_
+
+  
+
+梳理解析DeleteVolume的实现逻辑与流程，及其内部的函数调用关系
+
+  
+
+---
+
+  
+
+_**Assistant**_
+
+  
+
+我来帮你分析 DeleteVolume 的实现逻辑、流程和函数调用关系。
+
+  
+
+DeleteVolume 的主要流程可以分为以下几个关键步骤：
+
+  
+
+53. 请求验证和准备阶段:
+
+```go
+
+// 1.1 验证控制器服务请求
+
+cs.Driver.ValidateControllerServiceRequest()
+
+  
+
+// 1.2 检查 volumeID 是否为空
+
+if volumeID == "" {
+
+    return nil, status.Error(codes.InvalidArgument, "empty volume ID in request")
+
+}
+
+  
+
+// 1.3 创建用户凭证
+
+cr, err := util.NewUserCredentialsWithMigration(req.GetSecrets())
+
+```
+
+  
+
+54. 锁管理阶段:
+
+```go
+
+// 2.1 获取卷操作锁
+
+cs.VolumeLocks.TryAcquire(volumeID)
+
+  
+
+// 2.2 获取删除操作锁
+
+cs.OperationLocks.GetDeleteLock(volumeID)
+
+```
+
+  
+
+55. 迁移卷处理:
+
+```go
+
+// 如果是迁移卷，走特殊处理流程
+
+if isMigrationVolID(volumeID) {
+
+    pmVolID, pErr := parseMigrationVolID(volumeID)
+
+    // 删除迁移的卷
+
+    pErr = deleteMigratedVolume(ctx, pmVolID, cr)
+
+    return &csi.DeleteVolumeResponse{}, nil
+
+}
+
+```
+
+  
+
+56. 卷处理主流程:
+
+```go
+
+// 4.1 从卷ID生成 rbdVolume 对象
+
+rbdVol, err := GenVolFromVolID(ctx, volumeID, cr, req.GetSecrets())
+
+  
+
+// 4.2 获取卷名称锁
+
+cs.VolumeLocks.TryAcquire(rbdVol.RequestName)
+
+  
+
+// 4.3 清理 RBD 镜像
+
+cleanupRBDImage(ctx, rbdVol, cr)
+
+```
+
+  
+
+在 cleanupRBDImage 函数中的主要步骤:
+
+  
+
+57. 镜像状态检查:
+
+```go
+
+// 5.1 获取镜像镜像信息
+
+info, err := rbdVol.GetMirroringInfo(ctx)
+
+  
+
+// 5.2 如果是处于复制状态的从镜像，只清理元数据
+
+if info.GetState() == librbd.MirrorImageEnabled.String() && !info.IsPrimary() {
+
+    // 获取全局镜像状态
+
+    sts, rErr := rbdVol.GetGlobalMirroringStatus(ctx)
+
+    // 获取本地状态
+
+    localStatus, rErr := sts.GetLocalSiteStatus()
+
+    // 如果是正在复制的从镜像，只删除预留信息
+
+    undoVolReservation(ctx, rbdVol, cr)
+
+}
+
+```
+
+  
+
+58. 镜像删除:
+
+```go
+
+// 6.1 检查镜像是否在使用中
+
+inUse, err := rbdVol.isInUse()
+
+  
+
+// 6.2 删除临时镜像
+
+rbdVol.DeleteTempImage(ctx)
+
+  
+
+// 6.3 删除 RBD 镜像
+
+rbdVol.Delete(ctx)
+
+  
+
+// 6.4 清理卷预留信息
+
+undoVolReservation(ctx, rbdVol, cr)
+
+```
+
+  
+
+主要的函数调用关系:
+
+```
+
+DeleteVolume
+
+├── ValidateControllerServiceRequest
+
+├── NewUserCredentialsWithMigration
+
+├── VolumeLocks.TryAcquire/Release
+
+├── OperationLocks.GetDeleteLock/ReleaseDeleteLock
+
+├── isMigrationVolID
+
+│   └── deleteMigratedVolume (如果是迁移卷)
+
+├── GenVolFromVolID
+
+└── cleanupRBDImage
+
+    ├── GetMirroringInfo
+
+    ├── GetGlobalMirroringStatus
+
+    ├── isInUse
+
+    ├── DeleteTempImage
+
+    ├── Delete
+
+    └── undoVolReservation
+
+```
+
+  
+
+关键特性:
+
+59. 使用双重锁机制(卷锁和操作锁)确保并发安全
+
+60. 支持迁移卷的特殊处理
+
+61. 处理镜像复制场景
+
+62. 完整的清理流程包括临时镜像和元数据
+
+63. 全面的错误处理和资源释放
+
+  
+
+---
+
+  
+
+_**User**_
+
+  
+
+梳理解析rbdImage Delete的实现逻辑与流程，及其内部的函数调用关系
+
+  
+
+---
+
+  
+
+_**Assistant**_
+
+  
+  
+  
+
+让我帮你分析 rbdImage 的 Delete 方法的实现逻辑、流程和函数调用关系。
+
+  
+
+rbdImage.Delete 的主要流程可以分为以下几个关键步骤：
+
+  
+
+64. 前置准备:
+
+```go
+
+// 1.1 获取镜像 ID
+
+err := ri.getImageID()
+
+  
+
+// 1.2 打开 RADOS ioctx 上下文
+
+err = ri.openIoctx()
+
+```
+
+  
+
+65. 加密相关清理:
+
+```go
+
+// 2.1 处理块设备加密
+
+if ri.isBlockEncrypted() {
+
+    ri.blockEncryption.RemoveDEK(ctx, ri.VolID)
+
+}
+
+  
+
+// 2.2 处理文件系统加密
+
+if ri.isFileEncrypted() {
+
+    ri.fileEncryption.RemoveDEK(ctx, ri.VolID)
+
+}
+
+```
+
+  
+
+66. 镜像删除操作:
+
+```go
+
+// 3.1 获取 RBD 镜像对象
+
+rbdImage := librbd.GetImage(ri.ioctx, image)
+
+  
+
+// 3.2 将镜像移入垃圾箱
+
+err = rbdImage.Trash(0)
+
+```
+
+  
+
+67. 垃圾箱清理 (trashRemoveImage):
+
+```go
+
+// 4.1 尝试使用 Ceph Manager 进行删除
+
+ta, err := ri.conn.GetTaskAdmin()
+
+_, err = ta.AddTrashRemove(admin.NewImageSpec(...))
+
+  
+
+// 4.2 如果不支持 Ceph Manager，直接从垃圾箱删除
+
+if !rbdCephMgrSupported {
+
+    err = librbd.TrashRemove(ri.ioctx, ri.ImageID, true)
+
+}
+
+```
+
+  
+
+主要的函数调用关系:
+
+```
+
+Delete
+
+├── getImageID
+
+├── isBlockEncrypted
+
+│   └── blockEncryption.RemoveDEK
+
+├── isFileEncrypted
+
+│   └── fileEncryption.RemoveDEK
+
+├── openIoctx
+
+├── librbd.GetImage
+
+│   └── rbdImage.Trash
+
+└── trashRemoveImage
+
+    ├── conn.GetTaskAdmin
+
+    │   └── AddTrashRemove
+
+    └── librbd.TrashRemove (如果不支持 Ceph Manager)
+
+```
+
+  
+
+关键特性和处理:
+
+  
+
+68. 安全清理:
+
+   - 处理块设备加密的 DEK (Data Encryption Key) 清理
+
+   - 处理文件系统加密的 DEK 清理
+
+  
+
+69. 两阶段删除:
+
+   - 第一阶段：将镜像移入垃圾箱 (Trash)
+
+   - 第二阶段：从垃圾箱中永久删除
+
+  
+
+70. 双重删除机制:
+
+   - 优先使用 Ceph Manager 进行删除（异步任务）
+
+   - 降级使用直接删除方式（同步操作）
+
+  
+
+71. 错误处理:
+
+   - 处理镜像未找到的情况
+
+   - 加密清理失败时记录警告但继续执行
+
+   - 完整的错误传递链
+
+  
+
+72. 日志记录:
+
+   - 详细的操作日志
+
+   - 错误和警告信息的记录
+
+   - 调试信息的记录
+
+  
+
+这个实现确保了:
+
+73. 安全性 - 通过清理加密密钥
+
+74. 可靠性 - 通过两阶段删除机制
+
+75. 灵活性 - 支持多种删除方式
+
+76. 可追踪性 - 通过完整的日志记录
+
+  
+
+---
+
+  
+  
+  
 
 
 ---
