@@ -1,0 +1,404 @@
+Awesome—thanks for the detailed prompt. I’ll deliver the full design directly, organized exactly as requested.
+
+# 1) High-Level System Architecture
+
+```mermaid
+flowchart LR
+  A[Vue.js Frontend<br/>(TypeScript)] <--> B[FastAPI Backend<br/>(REST + WebSocket optional)]
+  B <--> D[(PostgreSQL)]
+  B <-- reads/writes --> E[[config.yml]]
+  subgraph Backend Process
+    B
+    C[APScheduler<br/>(AsyncIOScheduler)]
+  end
+  C -->|cron triggers| B
+  B -->|stream LO write| D
+  B -->|records metadata| D
+  A -->|CRUD sources & history| B
+  A -->|Download file| B -->|LO stream/read| D
+```
+
+**Key interactions**
+
+* Frontend hits FastAPI for source CRUD, history queries, on-demand “run now”, and downloads.
+* FastAPI owns `config.yml` (read/modify atomically) and (re)loads APScheduler jobs from it.
+* Scheduler triggers fetch jobs that stream data into PostgreSQL **Large Objects (LOs)** and record metadata rows.
+
+---
+
+# 2) Local Configuration File Design (YAML)
+
+### Goals
+
+* Human-readable.
+* Explicit `type` per source: `ssh` or `http`.
+* Independent cron expressions.
+* Optional toggles (`enabled`, `verify_tls`, etc.).
+* Stable source `name` acts as immutable identifier (referenced in DB metadata).
+
+### Example `config.yml`
+
+```yaml
+version: 1
+defaults:
+  retry:
+    max_attempts: 3
+    backoff_seconds: 10
+  http:
+    timeout_seconds: 60
+    verify_tls: true
+  ssh:
+    port: 22
+    known_hosts: "strict"   # strict|accept-new|ignore
+    connect_timeout_seconds: 20
+
+sources:
+  - name: "auth-log-prod"
+    type: "ssh"
+    enabled: true
+    schedule_cron: "0 */1 * * *"  # every hour
+    ssh:
+      host: "10.0.1.15"
+      port: 22
+      username: "logreader"
+      # Exactly one of (password | private_key_path). Prefer keys.
+      private_key_path: "/etc/app/keys/logreader_ed25519"
+      # optional: passphrase: "..."
+    remote_path: "/var/log/auth.log"
+    # Optional: rotate by date pattern, etc. (not required)
+    tags: ["prod", "security"]
+
+  - name: "service-tarball-staging"
+    type: "http"
+    enabled: true
+    schedule_cron: "30 */2 * * *"  # every 2 hours at :30
+    http:
+      url: "https://staging.example.com/artifacts/service.tar.gz"
+      headers:
+        Authorization: "Bearer ${SECRETS_SERVICE_TOKEN}"  # resolved by backend env at runtime
+      timeout_seconds: 90
+      verify_tls: true
+    filename_hint: "service.tar.gz"
+    tags: ["staging", "artifact"]
+
+# Optional: outbound proxy, notification hooks, etc.
+network:
+  http_proxy: null
+  https_proxy: null
+
+notifications:
+  on_success: []
+  on_failure: []
+```
+
+**Notes**
+
+* Secrets should not be stored literally; use environment variable interpolation like `${SECRETS_*}` resolved by the backend at runtime.
+* `name` must be unique and immutable once created; use it as the foreign key for metadata.
+
+---
+
+# 3) PostgreSQL Database Schema
+
+We store **metadata** only; file bytes live in a PostgreSQL **Large Object** (OID). We’ll keep a pragmatic `status` check constraint instead of a custom enum to simplify migrations.
+
+```sql
+-- Extension not required for LO usage, but useful for size functions, etc.
+-- CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE TABLE IF NOT EXISTS fetched_files (
+  id               BIGSERIAL PRIMARY KEY,
+  source_name      TEXT        NOT NULL,          -- matches config.yml "name"
+  fetched_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  status           TEXT        NOT NULL CHECK (status IN ('success','failed','partial')),
+  original_filename TEXT,                          -- if known (e.g., HTTP Content-Disposition or remote path basename)
+  file_size_bytes  BIGINT,                         -- bytes successfully written (null on failure before size known)
+  lo_oid           OID,                            -- OID of the Large Object (null on failure)
+  error_message    TEXT,                           -- on failure/partial
+  checksum_sha256  TEXT,                           -- optional: hex digest if computed
+  extra_meta       JSONB DEFAULT '{}'::jsonb       -- optional: headers, etag, ssh host, etc.
+);
+
+-- Helpful indexes
+CREATE INDEX IF NOT EXISTS idx_fetched_files_source_time
+  ON fetched_files (source_name, fetched_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_fetched_files_status_time
+  ON fetched_files (status, fetched_at DESC);
+```
+
+---
+
+# 4) Backend API Design (FastAPI)
+
+Base prefix: `/api`
+
+## Source Management (CRUD backed by `config.yml`)
+
+* **GET** `/api/sources`
+  List all sources (from `config.yml`), with effective schedules and enabled flags.
+* **POST** `/api/sources`
+  Create a new source. Body mirrors YAML structure for a single source. Persists to `config.yml` and registers a job.
+* **GET** `/api/sources/{name}`
+  Get one source by `name`.
+* **PUT** `/api/sources/{name}`
+  Update a source. Atomic write to `config.yml`, then reschedule job.
+* **DELETE** `/api/sources/{name}`
+  Remove a source from `config.yml` and unschedule its job.
+* **POST** `/api/sources/{name}:run-now`
+  Trigger an immediate fetch outside the normal schedule.
+* **POST** `/api/sources:validate`
+  Validate a source payload (cron, URL/SSH fields) without saving.
+
+## Config File
+
+* **GET** `/api/config`
+  Return the current parsed config (with secrets masked).
+* **PUT** `/api/config`
+  Replace entire config (atomic), rehydrate scheduler.
+
+## Fetch History & Download
+
+* **GET** `/api/fetches` (query: `source_name?`, `status?`, `from?`, `to?`, `limit?`, `offset?`)
+  Paginated list of metadata.
+* **GET** `/api/fetches/{id}`
+  Single metadata row.
+* **GET** `/api/fetches/{id}/download`
+  Stream the Large Object back as a file (sets `Content-Disposition` with best filename).
+* **DELETE** `/api/fetches/{id}`
+  Deletes metadata row **and** the associated LO (if present).
+* **POST** `/api/fetches/{id}:recompute-checksum`
+  Recompute and persist checksum from LO (optional).
+
+## Health & Ops
+
+* **GET** `/api/healthz`
+  Liveness/readiness.
+* **GET** `/api/scheduler/jobs`
+  Inspect current jobs (id, next run time).
+* **POST** `/api/scheduler/reload`
+  Force a full reload from `config.yml`.
+
+---
+
+# 5) Backend Logic & Scheduler Integration
+
+## 5.1 Configuration Service (safe read/write of `config.yml`)
+
+**Challenges:** avoiding corruption and race conditions when multiple API calls edit the file while the scheduler reads it.
+
+**Approach**
+
+* Parse with `ruamel.yaml` (preserve comments/formatting) or `PyYAML` if you don’t care about comments.
+* Use a **file lock** during writes (e.g., `filelock` or `portalocker`).
+* Perform **atomic writes**: write to a temp file in the same directory, `fsync`, then `os.replace()` onto `config.yml`.
+* Validate payloads against a Pydantic model before writing (cron, URL, SSH fields).
+* After successful write, publish an in-process event that instructs the Scheduler Service to **diff** jobs and re-add/remove/update.
+
+**Pseudo-code (write):**
+
+```python
+with filelock.FileLock("config.yml.lock"):
+    cfg = parse_config()           # read current
+    updated = apply_changes(cfg)   # validated by Pydantic
+    data = dump_yaml(updated)
+    with open(tmp, "w") as f:
+        f.write(data)
+        f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, "config.yml")
+# then
+scheduler.reload_from_config(updated)
+```
+
+## 5.2 Scheduler Service (APScheduler)
+
+* Use **AsyncIOScheduler** inside the FastAPI process.
+* On app startup:
+
+  1. Load `config.yml`.
+  2. For each `enabled` source, create a job with `CronTrigger.from_crontab(source.schedule_cron, timezone=app_tz)`.
+  3. Job `id` = stable source name (`name`).
+* On config changes:
+
+  * Compute diff: add/update/remove jobs accordingly.
+* Consider persistence via `SQLAlchemyJobStore` if you want jobs to survive restarts, but since jobs are recreated from `config.yml`, it’s optional.
+* Add jitter to avoid thundering herd (e.g., 0–30s) when many jobs share the same minute.
+* Provide a safe “run-now” endpoint that enqueues a single-shot trigger for a source.
+
+**APScheduler sketch:**
+
+```python
+scheduler = AsyncIOScheduler()
+scheduler.start()
+
+def schedule_source(src):
+    trigger = CronTrigger.from_crontab(src.schedule_cron, timezone="UTC")
+    scheduler.add_job(
+        func=run_fetch_job,
+        trigger=trigger,
+        id=src.name,
+        kwargs={"source": src},
+        max_instances=1, coalesce=True, misfire_grace_time=300
+    )
+```
+
+## 5.3 File Fetching & Storage Logic
+
+### Libraries
+
+* **SSH**: `asyncssh` (preferred for asyncio). Fallback: `paramiko` (sync).
+* **HTTP**: `httpx` (async client) with streaming.
+* **DB**: SQLAlchemy 2.x (async) + **a dedicated psycopg (v3) sync connection** for LO streaming (explained below).
+* **Checksums**: `hashlib` SHA-256 while streaming.
+* **Retries**: backoff with `tenacity` or custom.
+
+### Why a dedicated psycopg connection for Large Objects?
+
+* Async drivers like `asyncpg`/SQLAlchemy-async don’t expose PostgreSQL’s **LO streaming API** directly.
+* The most reliable approach is to maintain a tiny **sync psycopg3 pool** used **only** for LO read/write in a worker thread (so the FastAPI event loop isn’t blocked). ORM and metadata remain async with `asyncpg`.
+
+#### Strategy A (Recommended): psycopg3 LO streaming
+
+**Write path (chunked, zero-copy to DB where possible):**
+
+1. Start a **psycopg (sync)** transaction.
+2. Create an LO (`SELECT lo_create(0)` or `conn.lobject()` in psycopg’s LO API).
+3. Open LO for write; stream chunks from network directly to LO (e.g., 1–8MB).
+4. Track running `bytes_written`, update SHA-256.
+5. Commit the tx; record `lo_oid` and `file_size_bytes` in `fetched_files` using the **async** engine (or in the same sync tx if you prefer).
+6. On failure, ensure the LO is unlinked (`lo_unlink`) or don’t commit the LO transaction.
+
+**Read path (download):**
+
+* Open LO in read mode and stream chunks to the HTTP response generator.
+
+#### Strategy B (Alternative): `lo_from_bytea`
+
+* Buffering the whole file to memory (or temp file), then `SELECT lo_from_bytea(0, :bytes)` to create LO in one shot. Simpler but **not** memory-friendly for large files—use only for small artifacts.
+
+### SSH fetch (asyncssh)
+
+```python
+async def fetch_via_ssh(src, chunk_cb):
+    async with asyncssh.connect(
+        src.ssh.host, port=src.ssh.port, username=src.ssh.username,
+        client_keys=[src.ssh.private_key_path] if src.ssh.private_key_path else None,
+        password=src.ssh.password if hasattr(src.ssh, "password") else None,
+        known_hosts=None if src.ssh.known_hosts == "ignore" else asyncssh.read_known_hosts()
+    ) as conn:
+        async with conn.start_sftp_client() as sftp:
+            async with sftp.open(src.remote_path, "rb") as f:
+                while True:
+                    chunk = await f.read(1024 * 1024)  # 1MB
+                    if not chunk: break
+                    await chunk_cb(chunk)
+```
+
+### HTTP fetch (httpx)
+
+```python
+async def fetch_via_http(src, chunk_cb):
+    async with httpx.AsyncClient(timeout=src.http.timeout_seconds, verify=src.http.verify_tls) as client:
+        async with client.stream("GET", src.http.url, headers=src.http.headers or {}) as resp:
+            resp.raise_for_status()
+            async for chunk in resp.aiter_bytes(1024 * 1024):
+                await chunk_cb(chunk)
+```
+
+### Wiring fetch to LO write (threaded psycopg3 writer)
+
+```python
+# in the job
+async def run_fetch_job(source):
+    start = datetime.now(tz=timezone.utc)
+    status = "failed"; error = None; lo_oid = None; bytes_written = 0; sha256 = hashlib.sha256()
+
+    # open a dedicated psycopg3 connection in a thread
+    def writer():
+        with psycopg.connect(dsn) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT lo_create(0)")
+                oid = cur.fetchone()[0]
+                fd = conn.lobject(oid=oid, mode="w")  # psycopg3 LO API
+                return conn, cur, fd, oid
+
+    conn, cur, fd, lo_oid = await anyio.to_thread.run_sync(writer)
+
+    async def on_chunk(chunk: bytes):
+        nonlocal bytes_written, sha256
+        sha256.update(chunk)
+        # write to LO in the same thread to avoid blocking event loop
+        def _write():
+            fd.write(chunk)
+        await anyio.to_thread.run_sync(_write)
+        bytes_written += len(chunk)
+
+    try:
+        if source.type == "ssh":
+            await fetch_via_ssh(source, on_chunk)
+        else:
+            await fetch_via_http(source, on_chunk)
+
+        # finalize LO
+        await anyio.to_thread.run_sync(fd.close)
+        await anyio.to_thread.run_sync(conn.commit)
+        status = "success"
+    except Exception as e:
+        error = str(e)[:4000]
+        # cleanup LO
+        def _rollback_and_unlink():
+            try:
+                conn.rollback()
+                with conn.cursor() as c2:
+                    if lo_oid: c2.execute("SELECT lo_unlink(%s)", (lo_oid,))
+                conn.commit()
+            finally:
+                conn.close()
+        await anyio.to_thread.run_sync(_rollback_and_unlink)
+        lo_oid = None
+    finally:
+        # record metadata (async SQLAlchemy)
+        await async_session.execute(sa.text("""
+            INSERT INTO fetched_files
+              (source_name, status, original_filename, file_size_bytes, lo_oid, error_message, checksum_sha256, extra_meta)
+            VALUES
+              (:src, :status, :fname, :size, :loid, :err, :sha, :meta)
+        """), {
+            "src": source.name,
+            "status": status,
+            "fname": guess_filename(source),
+            "size": bytes_written if status == "success" else None,
+            "loid": lo_oid,
+            "err": error,
+            "sha": sha256.hexdigest() if status == "success" else None,
+            "meta": build_extra_meta(source)
+        })
+        await async_session.commit()
+```
+
+### Download endpoint (stream LO to client)
+
+* Use `StreamingResponse` with a generator that reads the LO in chunks from the psycopg3 connection (again in a thread) and yields to the async response.
+* Set headers:
+
+  * `Content-Type: application/octet-stream` (or detected)
+  * `Content-Disposition: attachment; filename="<name>"`
+
+### Additional concerns
+
+* **Backpressure & memory:** 1–8MB chunk size sweet spot.
+* **TLS verification:** default on; allow per-source override.
+* **Cron timezone:** pick one (e.g., UTC) and display localized times in UI.
+* **Observability:** structured logs; correlation IDs per job; metrics (counts, durations, bytes).
+* **Security:** never return secrets in API; mask in `/api/config`.
+* **Retention:** optional jobs to prune old LOs/metadata (e.g., keep last N per source or age-based).
+
+---
+
+## (Optional) Frontend UX Notes (Vue + TS)
+
+* **Views:** Sources, Source Editor (form + cron helper), History (filters, status chips), Detail Drawer (metadata + download button).
+* **Validation:** client-side schema mirrors backend Pydantic.
+* **Nice-to-have:** WebSocket push for job status to show in real-time.
+
+

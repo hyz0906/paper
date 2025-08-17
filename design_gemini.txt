@@ -1,0 +1,222 @@
+Here is a detailed system design for the Scheduled Log and File Fetcher System.
+
+-----
+
+### 1\. High-Level System Architecture
+
+The system operates with a clear separation between the user interface, the backend logic, and the data storage.
+
+  * **Vue.js Frontend:** The user interacts with the system through a single-page application in their browser. It communicates exclusively with the FastAPI backend via REST API calls to manage sources and view fetch history.
+  * **FastAPI Backend:** This is the core of the system. It serves the API for the frontend, manages the `config.yml` file, and runs the scheduler in a background thread.
+  * **APScheduler:** Integrated into the FastAPI application, it reads job definitions from the `config.yml` at startup and whenever the configuration is updated. At the scheduled time, it triggers the corresponding file-fetching task.
+  * **Local Configuration File (`config.yml`):** A single source of truth for all source definitions and schedules. The FastAPI server reads from this file to schedule jobs and writes to it when the user makes changes via the API.
+  * **PostgreSQL Database:** This has two roles:
+    1.  Storing metadata about every fetch attempt in the `fetched_files` table.
+    2.  Storing the actual file content using the built-in Large Object (`pg_largeobject`) facility.
+
+**Interaction Flow:**
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Vue.js Frontend
+    participant FastAPI Backend
+    participant APScheduler
+    participant Config File
+    participant PostgreSQL DB
+
+    User->>Vue.js Frontend: Add/Edit a Source
+    Vue.js Frontend->>FastAPI Backend: POST /api/sources
+    FastAPI Backend->>Config File: Write updated source list
+    FastAPI Backend->>APScheduler: Reloads jobs from config
+    Note over APScheduler: Job for the source is now scheduled
+
+    loop Scheduled Time
+        APScheduler->>FastAPI Backend: Trigger Fetch Job
+    end
+
+    FastAPI Backend->>PostgreSQL DB: 1. Create Large Object (gets OID)
+    FastAPI Backend->>Remote Server (SSH/HTTP): 2. Fetch file and stream data
+    Remote Server (SSH/HTTP)-->>FastAPI Backend: File Chunks
+    FastAPI Backend->>PostgreSQL DB: 3. Write chunks to Large Object
+    FastAPI Backend->>PostgreSQL DB: 4. Save metadata to 'fetched_files' table
+
+    User->>Vue.js Frontend: View Fetch History
+    Vue.js Frontend->>FastAPI Backend: GET /api/history
+    FastAPI Backend->>PostgreSQL DB: Query 'fetched_files' table
+    PostgreSQL DB-->>FastAPI Backend: Return metadata
+    FastAPI Backend-->>Vue.js Frontend: Send metadata list
+    Vue.js Frontend-->>User: Display history
+
+    User->>Vue.js Frontend: Download a File
+    Vue.js Frontend->>FastAPI Backend: GET /api/files/123/download
+    FastAPI Backend->>PostgreSQL DB: Stream Large Object with OID
+    PostgreSQL DB-->>FastAPI Backend: File Chunks
+    FastAPI Backend-->>User: Stream file to browser
+```
+
+-----
+
+### 2\. Local Configuration File Design
+
+Using **YAML** is recommended for its human-readability. The file will contain a list of `sources`, where each source is a dictionary with its specific configuration.
+
+**`config.yml` Example:**
+
+```yaml
+sources:
+  - name: "prod-app-server-logs"
+    type: "ssh"
+    enabled: true
+    schedule: "0 2 * * *" # Every day at 2:00 AM
+    connection:
+      host: "192.168.1.10"
+      port: 22
+      username: "logfetcher"
+      key_path: "/home/user/.ssh/id_rsa_logfetcher" # Path on the server running FastAPI
+    file_path: "/var/log/app/application.log.gz"
+
+  - name: "archived-reports-url"
+    type: "http"
+    enabled: true
+    schedule: "0 18 * * 5" # Every Friday at 6:00 PM
+    connection:
+      url: "https://example.com/reports/weekly_report.tar.gz"
+      # Optional: headers for authentication if needed
+      # headers:
+      #   Authorization: "Bearer your_token_here"
+    file_path: "weekly_report.tar.gz" # Used as the default filename
+
+  - name: "staging-db-backups"
+    type: "ssh"
+    enabled: false # This job will not be scheduled
+    schedule: "0 1 * * *"
+    connection:
+      host: "staging.server.com"
+      username: "backup_user"
+      key_path: "/home/user/.ssh/id_rsa_staging"
+    file_path: "/opt/backups/latest.sql.tar.bz2"
+```
+
+-----
+
+### 3\. PostgreSQL Database Schema
+
+The schema focuses on a single table to store metadata for each fetch operation. The file data is handled by PostgreSQL's internal `pg_largeobject` table, which we reference via its Object ID (`loid`).
+
+**`fetched_files` Table Definition:**
+
+```sql
+-- Create a custom ENUM type for status for data consistency
+CREATE TYPE fetch_status AS ENUM ('success', 'failed');
+
+-- Main table for storing metadata of fetched files
+CREATE TABLE fetched_files (
+    -- A unique identifier for each fetch record
+    id SERIAL PRIMARY KEY,
+
+    -- The unique 'name' from the config.yml to identify the source
+    source_name VARCHAR(255) NOT NULL,
+
+    -- Timestamp when the fetch attempt was made
+    fetched_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+    -- The result of the fetch operation
+    status fetch_status NOT NULL,
+
+    -- The original name of the file from the remote source
+    original_filename VARCHAR(512),
+
+    -- Size of the file in bytes. NULL if fetch failed before getting size.
+    file_size_bytes BIGINT,
+
+    -- The Object Identifier (OID) referencing the file in pg_largeobject.
+    -- This will be NULL if the fetch failed.
+    loid OID,
+
+    -- Stores any error message if the status is 'failed'
+    error_message TEXT,
+
+    -- Index for efficient querying of history by source
+    INDEX idx_source_name (source_name)
+);
+```
+
+-----
+
+### 4\. Backend API Design (FastAPI)
+
+The API provides endpoints for managing the system and accessing data.
+
+| Method | Path                               | Description                                                                                              |
+| :----- | :--------------------------------- | :------------------------------------------------------------------------------------------------------- |
+| `GET`    | `/api/sources`                     | Retrieves the list of all configured sources from `config.yml`.                                          |
+| `POST`   | `/api/sources`                     | Adds a new source to `config.yml` and reloads the scheduler. The request body contains the source object. |
+| `PUT`    | `/api/sources/{source_name}`       | Updates an existing source in `config.yml` and reloads the scheduler.                                    |
+| `DELETE` | `/api/sources/{source_name}`       | Removes a source from `config.yml` and reloads the scheduler.                                            |
+| `POST`   | `/api/sources/{source_name}/trigger` | Manually triggers a one-off fetch job for the specified source, outside its normal schedule.             |
+| `GET`    | `/api/history`                     | Retrieves a paginated list of all fetch records (metadata) from the `fetched_files` table.               |
+| `GET`    | `/api/files/{file_id}/download`    | Downloads a specific file. It uses the `file_id` to look up the `loid` and streams the Large Object.    |
+
+-----
+
+### 5\. Backend Logic and Scheduler Integration
+
+#### Configuration Service
+
+The `config.yml` file is a shared resource, so access must be synchronized.
+
+  * **Reading:** On application startup, the YAML file is loaded into an in-memory Python dictionary or a Pydantic model for easy access and validation.
+  * **Writing:** All API endpoints that modify the configuration (`POST`, `PUT`, `DELETE` on `/api/sources`) will use a thread-safe locking mechanism. A library like **`filelock`** is ideal.
+      * **Process:**
+        1.  Acquire a lock on the `config.yml` file.
+        2.  Read the current content.
+        3.  Modify the in-memory representation (add/update/remove a source).
+        4.  Write the entire modified structure back to `config.yml`.
+        5.  Release the lock.
+        6.  Signal the scheduler service to reload jobs.
+
+#### Scheduler Service (`APScheduler`)
+
+  * **Initialization:** The scheduler will be initialized when the FastAPI application starts. An `AsyncIOScheduler` is suitable for an async framework.
+  * **Job Loading:** A central function, let's call it `reload_scheduler_jobs()`, will be responsible for populating the scheduler.
+    1.  It will first remove all existing jobs to prevent duplicates.
+    2.  It will then read the list of sources from the configuration service.
+    3.  For each source where `enabled: true`, it will add a new job using `scheduler.add_job()`.
+          * The trigger will be `CronTrigger` based on the `schedule` string.
+          * The function to be executed will be the main file-fetching logic.
+          * The source's full configuration dictionary will be passed as an argument.
+  * **Triggering Reload:** The `reload_scheduler_jobs()` function will be called once on startup and again after any successful API call that modifies the `config.yml` file.
+
+#### File Fetching & Storage Logic
+
+This is the core task executed by the scheduler for each job. It should be an `async` function.
+
+  * **Libraries:** **`asyncssh`** for non-blocking SSH operations and **`httpx`** for async HTTP requests. **`psycopg`** (the driver behind `asyncpg`) provides the interface for Large Objects.
+
+  * **Execution Steps:**
+
+    1.  **Get DB Connection:** Obtain a database connection from a connection pool.
+    2.  **Begin Transaction:** Start a database transaction.
+    3.  **Create Large Object:** Using the connection's raw `psycopg` interface, create a new large object: `lobject = await conn.lobject()`. This `lobject` has methods like `write()` and `close()`, and its `oid` attribute holds the OID.
+    4.  **Fetch & Stream:**
+          * **For SSH (`asyncssh`):**
+              * Establish an SSH connection.
+              * Open the remote file for reading: `async with ssh_conn.start_sftp_client() as sftp:`.
+              * Read the file in chunks in a loop: `while chunk := await sftp_file.read(CHUNK_SIZE):`.
+              * In each iteration, write the chunk to the PostgreSQL Large Object: `await lobject.write(chunk)`.
+          * **For HTTP (`httpx`):**
+              * Create an `httpx.AsyncClient`.
+              * Make a streaming GET request: `async with client.stream('GET', url) as response:`.
+              * Iterate over the content chunks: `async for chunk in response.aiter_bytes():`.
+              * Write each chunk to the Large Object: `await lobject.write(chunk)`.
+    5.  **Finalize and Record:**
+          * **On Success:**
+              * Close the large object: `await lobject.close()`.
+              * Get the total file size.
+              * Insert a new record into the `fetched_files` table with `status='success'`, the filename, file size, and the `loid`.
+              * Commit the transaction.
+          * **On Failure (in an `except` block):**
+              * Roll back the transaction (this automatically discards the partially created large object).
+              * Insert a record into `fetched_files` with `status='failed'` and the captured error message. The `loid` and `file_size_bytes` will be `NULL`.
+    6.  **Release DB Connection:** Return the connection to the pool.
